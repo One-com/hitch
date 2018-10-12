@@ -81,6 +81,8 @@
 #include "foreign/vpf.h"
 #include "foreign/uthash.h"
 #include "foreign/vsa.h"
+#include "foreign/rwlock.h"
+#include "foreign/atomic.h"
 
 #ifndef MSG_NOSIGNAL
 # define MSG_NOSIGNAL 0
@@ -142,27 +144,6 @@ static unsigned worker_gen;
 static volatile unsigned n_sighup;
 static volatile unsigned n_sigchld;
 
-enum worker_state_e {
-	WORKER_ACTIVE,
-	WORKER_EXITING
-};
-
-static enum worker_state_e worker_state;
-
-struct worker_proc {
-	unsigned			magic;
-#define WORKER_PROC_MAGIC		0xbc7fe9e6
-
-	/* Writer end of pipe(2) for mgt -> worker ipc */
-	int				pfd;
-	pid_t				pid;
-	unsigned			gen;
-	int				core_id;
-	VTAILQ_ENTRY(worker_proc)	list;
-};
-
-VTAILQ_HEAD(worker_proc_head, worker_proc);
-static struct worker_proc_head worker_procs;
 struct sslctx_s;
 struct sni_name_s;
 
@@ -194,6 +175,36 @@ struct frontend {
 VTAILQ_HEAD(frontend_head, frontend);
 
 static struct frontend_head frontends;
+
+enum worker_state_e {
+	WORKER_ACTIVE,
+	WORKER_EXITING
+};
+
+static enum worker_state_e worker_state;
+
+typedef struct connection_handler_listener_set {
+	struct ev_loop* ev_loop_thread;
+	struct frontend_head thread_frontends;
+	pthread_t thr_id;
+} connection_handler_listener_set_t;
+
+struct worker_proc {
+	unsigned			magic;
+#define WORKER_PROC_MAGIC		0xbc7fe9e6
+
+	/* Writer end of pipe(2) for mgt -> worker ipc */
+	int				pfd;
+	pid_t				pid;
+	unsigned			gen;
+	int				core_id;
+	VTAILQ_ENTRY(worker_proc)	list;
+	connection_handler_listener_set_t* chls;
+	int				thr_count;
+};
+
+VTAILQ_HEAD(worker_proc_head, worker_proc);
+static struct worker_proc_head worker_procs;
 
 #ifdef USE_SHARED_CACHE
 static ev_io shcupd_listener;
@@ -1484,6 +1495,7 @@ static struct backend *
 backend_ref(void)
 {
 	CHECK_OBJ_NOTNULL(backaddr, BACKEND_MAGIC);
+	// :TODO: atomic OPS
 	AN(backaddr->ref);
 	backaddr->ref++;
 	return (backaddr);
@@ -1497,7 +1509,9 @@ backend_deref(struct backend **be)
 	b = *be;
 
 	CHECK_OBJ_NOTNULL(b, BACKEND_MAGIC);
+
 	AN(b->ref);
+	// :TODO: atomic OPS
 	b->ref--;
 
 	if (b->ref == 0) {
@@ -1540,7 +1554,7 @@ create_back_socket(struct backend *b)
 /* Only enable a libev ev_io event if the proxied connection still
  * has both up and down connected */
 static void
-safe_enable_io(proxystate *ps, ev_io *w)
+safe_enable_io(struct ev_loop* loop, proxystate *ps, ev_io *w)
 {
 	CHECK_OBJ_NOTNULL(ps, PROXYSTATE_MAGIC);
 	if (!ps->want_shutdown)
@@ -1560,7 +1574,7 @@ check_exit_state(void)
 /* Only enable a libev ev_io event if the proxied connection still
  * has both up and down connected */
 static void
-shutdown_proxy(proxystate *ps, SHUTDOWN_REQUESTOR req)
+shutdown_proxy(struct ev_loop* loop, proxystate *ps, SHUTDOWN_REQUESTOR req)
 {
 	CHECK_OBJ_NOTNULL(ps, PROXYSTATE_MAGIC);
 	LOGPROXY(ps, "proxy shutdown req=%s\n", SHUTDOWN_STR[req]);
@@ -1589,6 +1603,7 @@ shutdown_proxy(proxystate *ps, SHUTDOWN_REQUESTOR req)
 		ringbuffer_cleanup(&ps->ring_ssl2clear);
 		free(ps);
 
+		// :TODO: atomic OPS
 		n_conns--;
 		check_exit_state();
 	}
@@ -1596,16 +1611,16 @@ shutdown_proxy(proxystate *ps, SHUTDOWN_REQUESTOR req)
 		ps->want_shutdown = 1;
 		if (req == SHUTDOWN_CLEAR &&
 		    ringbuffer_is_empty(&ps->ring_clear2ssl))
-			shutdown_proxy(ps, SHUTDOWN_HARD);
+			shutdown_proxy(loop, ps, SHUTDOWN_HARD);
 		else if (req == SHUTDOWN_SSL &&
 		    ringbuffer_is_empty(&ps->ring_ssl2clear))
-			shutdown_proxy(ps, SHUTDOWN_HARD);
+			shutdown_proxy(loop, ps, SHUTDOWN_HARD);
 	}
 }
 
 /* Handle various socket errors */
 static void
-handle_socket_errno(proxystate *ps, int backend)
+handle_socket_errno(struct ev_loop* loop, proxystate *ps, int backend)
 {
 	CHECK_OBJ_NOTNULL(ps, PROXYSTATE_MAGIC);
 	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
@@ -1615,12 +1630,12 @@ handle_socket_errno(proxystate *ps, int backend)
 		ERR("{backend} Socket error: %s\n", strerror(errno));
 	else
 		LOG("{client} Socket error: %s\n", strerror(errno));
-	shutdown_proxy(ps, SHUTDOWN_CLEAR);
+	shutdown_proxy(loop, ps, SHUTDOWN_CLEAR);
 }
 
 /* Start connect to backend */
 static int
-start_connect(proxystate *ps)
+start_connect(struct ev_loop* loop, proxystate *ps)
 {
 	int t = 1;
 	socklen_t len;
@@ -1639,7 +1654,7 @@ start_connect(proxystate *ps)
 	}
 
 	ERR("{backend-connect}: %s\n", strerror(errno));
-	shutdown_proxy(ps, SHUTDOWN_HARD);
+	shutdown_proxy(loop, ps, SHUTDOWN_HARD);
 
 	return (-1);
 }
@@ -1667,16 +1682,16 @@ clear_read(struct ev_loop *loop, ev_io *w, int revents)
 		if (ringbuffer_is_full(&ps->ring_clear2ssl))
 			ev_io_stop(loop, &ps->ev_r_clear);
 		if (ps->handshaked)
-			safe_enable_io(ps, &ps->ev_w_ssl);
+			safe_enable_io(loop, ps, &ps->ev_w_ssl);
 	}
 	else if (t == 0) {
 		LOGPROXY(ps,"Connection closed by %s\n",
 		    fd == ps->fd_down ? "backend" : "client");
-		shutdown_proxy(ps, SHUTDOWN_CLEAR);
+		shutdown_proxy(loop, ps, SHUTDOWN_CLEAR);
 	}
 	else {
 		assert(t == -1);
-		handle_socket_errno(ps, fd == ps->fd_down ? 1 : 0);
+		handle_socket_errno(loop, ps, fd == ps->fd_down ? 1 : 0);
 	}
 }
 
@@ -1702,10 +1717,10 @@ clear_write(struct ev_loop *loop, ev_io *w, int revents)
 		if (t == sz) {
 			ringbuffer_read_pop(&ps->ring_ssl2clear);
 			if (ps->handshaked)
-				safe_enable_io(ps, &ps->ev_r_ssl);
+				safe_enable_io(loop, ps, &ps->ev_r_ssl);
 			if (ringbuffer_is_empty(&ps->ring_ssl2clear)) {
 				if (ps->want_shutdown) {
-					shutdown_proxy(ps, SHUTDOWN_HARD);
+					shutdown_proxy(loop, ps, SHUTDOWN_HARD);
 					return; // dealloc'd
 				}
 				ev_io_stop(loop, &ps->ev_w_clear);
@@ -1715,11 +1730,11 @@ clear_write(struct ev_loop *loop, ev_io *w, int revents)
 		}
 	} else {
 		assert(t == -1);
-		handle_socket_errno(ps, fd == ps->fd_down ? 1 : 0);
+		handle_socket_errno(loop, ps, fd == ps->fd_down ? 1 : 0);
 	}
 }
 
-static void start_handshake(proxystate *ps, int err);
+static void start_handshake(struct ev_loop *loop, proxystate *ps, int err);
 
 static unsigned
 sockaddr_port(const struct sockaddr *sa)
@@ -1777,7 +1792,7 @@ handle_connect(struct ev_loop *loop, ev_io *w, int revents)
 
 			/* if incoming buffer is not full */
 			if (!ringbuffer_is_full(&ps->ring_clear2ssl))
-				safe_enable_io(ps, &ps->ev_r_clear);
+				safe_enable_io(loop, ps, &ps->ev_r_clear);
 
 			/* if outgoing buffer is not empty */
 			if (!ringbuffer_is_empty(&ps->ring_ssl2clear))
@@ -1787,14 +1802,14 @@ handle_connect(struct ev_loop *loop, ev_io *w, int revents)
 		} else {
 			/* Clear side already connected so connect is on
 			 * secure side: perform handshake */
-			start_handshake(ps, SSL_ERROR_WANT_WRITE);
+			start_handshake(loop, ps, SSL_ERROR_WANT_WRITE);
 		}
 	}
 	else if (errno == EINPROGRESS || errno == EINTR || errno == EALREADY) {
 		/* do nothing, we'll get phoned home again... */
 	} else {
 		ERR("{backend-connect}: %s\n", strerror(errno));
-		shutdown_proxy(ps, SHUTDOWN_HARD);
+		shutdown_proxy(loop, ps, SHUTDOWN_HARD);
 	}
 }
 
@@ -1812,7 +1827,7 @@ connect_timeout(EV_P_ ev_timer *w, int revents)
 /* Upon receiving a signal from OpenSSL that a handshake is required, re-wire
  * the read/write events to hook up to the handshake handlers */
 static void
-start_handshake(proxystate *ps, int err)
+start_handshake(struct ev_loop *loop, proxystate *ps, int err)
 {
 	CHECK_OBJ_NOTNULL(ps, PROXYSTATE_MAGIC);
 
@@ -2023,7 +2038,7 @@ static int is_alpn_shutdown_needed(proxystate *ps) {
 
 /* After OpenSSL is done with a handshake, re-wire standard read/write handlers
  * for data transmission */
-static void end_handshake(proxystate *ps) {
+static void end_handshake(struct ev_loop* loop, proxystate *ps) {
 	CHECK_OBJ_NOTNULL(ps, PROXYSTATE_MAGIC);
 	ev_io_stop(loop, &ps->ev_r_handshake);
 	ev_io_stop(loop, &ps->ev_w_handshake);
@@ -2031,7 +2046,7 @@ static void end_handshake(proxystate *ps) {
 
 #if defined(OPENSSL_WITH_NPN) || defined(OPENSSL_WITH_ALPN)
 	if (is_alpn_shutdown_needed(ps)) {
-		shutdown_proxy(ps, SHUTDOWN_HARD);
+		shutdown_proxy(loop, ps, SHUTDOWN_HARD);
 		return;
 	}
 #endif
@@ -2066,7 +2081,7 @@ static void end_handshake(proxystate *ps) {
 		}
 
 		/* start connect now */
-		if (0 != start_connect(ps))
+		if (0 != start_connect(loop, ps))
 			return;
 	} else {
 		/* hitch used in client mode, keep client session ) */
@@ -2079,7 +2094,7 @@ static void end_handshake(proxystate *ps) {
 
 	/* if incoming buffer is not full */
 	if (!ringbuffer_is_full(&ps->ring_ssl2clear))
-		safe_enable_io(ps, &ps->ev_r_ssl);
+		safe_enable_io(loop, ps, &ps->ev_r_ssl);
 
 	/* if outgoing buffer is not empty */
 	if (!ringbuffer_is_empty(&ps->ring_clear2ssl))
@@ -2108,11 +2123,11 @@ client_proxy_proxy(struct ev_loop *loop, ev_io *w, int revents)
 
 	if (proxy == end) {
 		LOG("{client} Unexpectedly long PROXY line. Malformed req?");
-		shutdown_proxy(ps, SHUTDOWN_SSL);
+		shutdown_proxy(loop, ps, SHUTDOWN_SSL);
 	} else if (t == 1) {
 		if (ringbuffer_is_full(&ps->ring_ssl2clear)) {
 			LOG("{client} Error writing PROXY line");
-			shutdown_proxy(ps, SHUTDOWN_SSL);
+			shutdown_proxy(loop, ps, SHUTDOWN_SSL);
 			return;
 		}
 
@@ -2126,11 +2141,11 @@ client_proxy_proxy(struct ev_loop *loop, ev_io *w, int revents)
 			ev_io_stop(loop, &ps->ev_proxy);
 
 			// Start the real handshake
-			start_handshake(ps, SSL_ERROR_WANT_READ);
+			start_handshake(loop, ps, SSL_ERROR_WANT_READ);
 		}
 	} else if (!BIO_should_retry(b)) {
 		LOG("{client} Unexpected error reading PROXY line");
-		shutdown_proxy(ps, SHUTDOWN_SSL);
+		shutdown_proxy(loop, ps, SHUTDOWN_SSL);
 	}
 }
 
@@ -2152,7 +2167,7 @@ client_handshake(struct ev_loop *loop, ev_io *w, int revents)
 	LOGPROXY(ps,"ssl client handshake revents=%x\n",revents);
 	t = SSL_do_handshake(ps->ssl);
 	if (t == 1) {
-		end_handshake(ps);
+		end_handshake(loop, ps);
 	} else {
 		errno_val = errno;
 		int err = SSL_get_error(ps->ssl, t);
@@ -2175,12 +2190,12 @@ client_handshake(struct ev_loop *loop, ev_io *w, int revents)
 		} else if (err == SSL_ERROR_ZERO_RETURN) {
 			LOG("{%s} Connection closed (in handshake)\n",
 			    w->fd == ps->fd_up ? "client" : "backend");
-			shutdown_proxy(ps, SHUTDOWN_SSL);
+			shutdown_proxy(loop, ps, SHUTDOWN_SSL);
 		} else if (err == SSL_ERROR_SYSCALL) {
 			LOG("{%s} SSL socket error in handshake: %s\n",
 			    w->fd == ps->fd_up ? "client" : "backend",
 			    strerror(errno_val));
-			shutdown_proxy(ps, SHUTDOWN_SSL);
+			shutdown_proxy(loop, ps, SHUTDOWN_SSL);
 		} else {
 			if (err == SSL_ERROR_SSL) {
 				log_ssl_error(ps, "Handshake failure");
@@ -2190,20 +2205,20 @@ client_handshake(struct ev_loop *loop, ev_io *w, int revents)
 				    w->fd == ps->fd_up ? "client" : "backend",
 				    err);
 			}
-			shutdown_proxy(ps, SHUTDOWN_SSL);
+			shutdown_proxy(loop, ps, SHUTDOWN_SSL);
 		}
 	}
 }
 
 static void
-handshake_timeout(EV_P_ ev_timer *w, int revents)
+handshake_timeout(struct ev_loop *loop, ev_timer *w, int revents)
 {
 	(void)loop;
 	(void)revents;
 	proxystate *ps;
 	CAST_OBJ_NOTNULL(ps, w->data, PROXYSTATE_MAGIC);
 	LOGPROXY(ps,"SSL handshake timeout\n");
-	shutdown_proxy(ps, SHUTDOWN_HARD);
+	shutdown_proxy(loop, ps, SHUTDOWN_HARD);
 }
 
 #define SSLERR(ps, which, log)						\
@@ -2226,7 +2241,7 @@ handshake_timeout(EV_P_ ev_timer *w, int revents)
 
 /* Handle a socket error condition passed to us from OpenSSL */
 static void
-handle_fatal_ssl_error(proxystate *ps, int err, int backend)
+handle_fatal_ssl_error(struct ev_loop* loop, proxystate *ps, int err, int backend)
 {
 	CHECK_OBJ_NOTNULL(ps, PROXYSTATE_MAGIC);
 	if (backend) {
@@ -2234,7 +2249,7 @@ handle_fatal_ssl_error(proxystate *ps, int err, int backend)
 	} else {
 		SSLERR(ps, "client", LOGPROXY);
 	}
-	shutdown_proxy(ps, SHUTDOWN_SSL);
+	shutdown_proxy(loop, ps, SHUTDOWN_SSL);
 }
 
 /* Read some data from the upstream secure socket via OpenSSL,
@@ -2263,7 +2278,7 @@ ssl_read(struct ev_loop *loop, ev_io *w, int revents)
 
 	/* Fix CVE-2009-3555. Disable reneg if started by client. */
 	if (ps->renegotiation) {
-		shutdown_proxy(ps, SHUTDOWN_SSL);
+		shutdown_proxy(loop, ps, SHUTDOWN_SSL);
 		return;
 	}
 
@@ -2272,18 +2287,18 @@ ssl_read(struct ev_loop *loop, ev_io *w, int revents)
 		if (ringbuffer_is_full(&ps->ring_ssl2clear))
 			ev_io_stop(loop, &ps->ev_r_ssl);
 		if (ps->clear_connected)
-			safe_enable_io(ps, &ps->ev_w_clear);
+			safe_enable_io(loop, ps, &ps->ev_w_clear);
 	} else {
 		int err = SSL_get_error(ps->ssl, t);
 		if (err == SSL_ERROR_WANT_WRITE) {
-			start_handshake(ps, err);
+			start_handshake(loop, ps, err);
 		} else if (err == SSL_ERROR_WANT_READ) {
 			/* NOOP. Incomplete SSL data */
 		} else {
 			if (err == SSL_ERROR_SSL) {
 				log_ssl_error(ps, "SSL_read error");
 			}
-			handle_fatal_ssl_error(ps, err,
+			handle_fatal_ssl_error(loop, ps, err,
 			    w->fd == ps->fd_up ? 0 : 1);
 		}
 	}
@@ -2309,10 +2324,10 @@ ssl_write(struct ev_loop *loop, ev_io *w, int revents)
 			ringbuffer_read_pop(&ps->ring_clear2ssl);
 			if (ps->clear_connected)
 				// can be re-enabled b/c we've popped
-				safe_enable_io(ps, &ps->ev_r_clear);
+				safe_enable_io(loop, ps, &ps->ev_r_clear);
 			if (ringbuffer_is_empty(&ps->ring_clear2ssl)) {
 				if (ps->want_shutdown) {
-					shutdown_proxy(ps, SHUTDOWN_HARD);
+					shutdown_proxy(loop, ps, SHUTDOWN_HARD);
 					return;
 				}
 				ev_io_stop(loop, &ps->ev_w_ssl);
@@ -2323,7 +2338,7 @@ ssl_write(struct ev_loop *loop, ev_io *w, int revents)
 	} else {
 		int err = SSL_get_error(ps->ssl, t);
 		if (err == SSL_ERROR_WANT_READ) {
-			start_handshake(ps, err);
+			start_handshake(loop, ps, err);
 		} else if (err == SSL_ERROR_WANT_WRITE) {
 			/* NOOP. Incomplete SSL data */
 		} else {
@@ -2334,7 +2349,7 @@ ssl_write(struct ev_loop *loop, ev_io *w, int revents)
 				    w->fd == ps->fd_up ? "client" : "backend",
 				    err);
 			}
-			handle_fatal_ssl_error(ps, err,
+			handle_fatal_ssl_error(loop, ps, err,
 			    w->fd == ps->fd_up ? 0 : 1);
 		}
 	}
@@ -2493,15 +2508,14 @@ handle_accept(struct ev_loop *loop, ev_io *w, int revents)
 
 	/* Link back proxystate to SSL state */
 	SSL_set_app_data(ssl, ps);
-
+	// :TODO: atomic operation
 	n_conns++;
-
 	LOGPROXY(ps, "proxy connect\n");
 	if (CONFIG->PROXY_PROXY_LINE) {
 		ev_io_start(loop, &ps->ev_proxy);
 	} else {
 		/* for client-first handshake */
-		start_handshake(ps, SSL_ERROR_WANT_READ);
+		start_handshake(loop, ps, SSL_ERROR_WANT_READ);
 	}
 }
 
@@ -2730,11 +2744,151 @@ handle_clear_accept(struct ev_loop *loop, ev_io *w, int revents)
 
 	/* Link back proxystate to SSL state */
 	SSL_set_app_data(ssl, ps);
-
+	// :TODO: atomic apos
 	n_conns++;
-
 	ev_io_start(loop, &ps->ev_r_clear);
-	start_connect(ps); /* start connect */
+	start_connect(loop, ps); /* start connect */
+}
+
+
+static rwlock_t* lockarray;
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000
+
+	static void lock_callback(int mode, int type, char *file, int line) {
+		(void)file;
+		(void)line;
+		if(mode & CRYPTO_LOCK) {
+			write_lock(&(lockarray[type]));
+		}
+		else {
+			write_unlock(&(lockarray[type]));
+		}
+	}
+
+	#if OPENSSL_VERSION_NUMBER >= 0x10000000
+		// use new CRYPTO_THREADID API
+		static void thread_id(CRYPTO_THREADID *id) {
+			CRYPTO_THREADID_set_numeric(id, (unsigned long) pthread_self());
+		}
+	#else
+		static unsigned long thread_id(void) {
+			unsigned long ret;
+
+			ret = (unsigned long) pthread_self();
+
+			return ret;
+		}
+	#endif
+#endif
+
+static void init_ssl_locks(void) {
+	int i;
+
+	lockarray = (rwlock_t*)OPENSSL_malloc(CRYPTO_num_locks() *
+                                                sizeof(rwlock_t));
+	for(i = 0; i<CRYPTO_num_locks(); i++) {
+		rwlock_init(&(lockarray[i]));
+	}
+
+
+#if OPENSSL_VERSION_NUMBER >= 0x10000000
+    CRYPTO_THREADID_set_callback((void(*)(CRYPTO_THREADID *))thread_id);
+#else
+    CRYPTO_set_id_callback((unsigned long (*)())thread_id);
+#endif
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000
+    // Defined as a NO-OP in openssl 1.1.0
+    CRYPTO_set_locking_callback((void (*)())lock_callback);
+#endif
+}
+
+static void deinit_ssl_locks(void) {
+
+	CRYPTO_set_locking_callback(NULL);
+
+	OPENSSL_free(lockarray);
+}
+
+static void connection_handler_cleanup_func(void *arg) {
+	struct frontend *fr;
+	struct listen_sock *ls;
+	struct connection_handler_listener_set* ls_set;
+
+	if (arg == NULL) {
+		ERR("{core} connection_handler_cleanup_func failed, no connection_handler_listener_set specified\n");
+		return;
+	}
+	ls_set = (struct connection_handler_listener_set*) arg;
+
+	// :NOTE: Ideally we should have a graceful connection drain to clear out existing
+	// ssl session but that would mean keeping an extra copy of all the ssl certificates
+	// till all the sessions are available.
+	ev_break(ls_set->ev_loop_thread, EVBREAK_ALL);
+
+	// Just try to close all connections if possible
+	VTAILQ_FOREACH(fr, &(ls_set->thread_frontends), list) {
+		CHECK_OBJ_NOTNULL(fr, FRONTEND_MAGIC);
+		VTAILQ_FOREACH(ls, &fr->socks, list) {
+			CHECK_OBJ_NOTNULL(ls, LISTEN_SOCK_MAGIC);
+			ev_io_stop(ls_set->ev_loop_thread, &ls->listener);
+			close(ls->sock);
+		}
+	}
+	LOGL("connection_handler_cleanup_func closed all listeners.\n");
+}
+
+
+static void prepare_connection_handler_listener_set(connection_handler_listener_set_t* ls_set) {
+	struct frontend *fr;
+	struct listen_sock *ls;
+	struct front_arg *fa, *ftmp;
+
+	// initialize connection_handler_listener_set
+	ls_set->ev_loop_thread = ev_loop_new(EVFLAG_AUTO);
+	VTAILQ_INIT(&(ls_set->thread_frontends));
+
+	// initialize configuration
+	HASH_ITER(hh, CONFIG->LISTEN_ARGS, fa, ftmp) {
+		struct frontend *fr = create_frontend(fa);
+		if (fr == NULL) {
+			ERR("{core} prepare_connection_handler_listener_set create_frontend failed: %s\n", strerror(errno));
+			exit(1);
+		}
+		VTAILQ_INSERT_TAIL(&(ls_set->thread_frontends), fr, list);
+	}
+
+	VTAILQ_FOREACH(fr, &(ls_set->thread_frontends), list) {
+		VTAILQ_FOREACH(ls, &fr->socks, list) {
+			ev_io_init(&ls->listener,
+				(CONFIG->PMODE == SSL_CLIENT) ?
+				handle_clear_accept : handle_accept,
+				ls->sock, EV_READ);
+			ls->listener.data = fr;
+			ev_io_start(ls_set->ev_loop_thread, &ls->listener);
+		}
+	}
+}
+
+/* Set up the worker thread inside child-process context including libev event loop,
+ * on the bound sockets, etc */
+static void* connection_handler_thread_func(void* arg) {
+	connection_handler_listener_set_t* ls_set = NULL;
+	if (arg == NULL) {
+		ERR("{core} connection_handler_thread_func failed, no connection_handler_listener_set specified\n");
+		exit(1);
+	}
+
+	ls_set = (struct connection_handler_listener_set*)arg;
+
+	pthread_cleanup_push(connection_handler_cleanup_func, ls_set);
+
+	ev_loop(ls_set->ev_loop_thread, 0);
+
+    pthread_cleanup_pop(1);
+
+	return NULL;
 }
 
 /* Set up the child (worker) process including libev event loop, read event
@@ -2815,7 +2969,6 @@ handle_connections(int mgt_fd)
 	ERR("Worker %d (gen: %d) exiting.\n", core_id, worker_gen);
 	_exit(1);
 }
-
 
 /*
    OCSP requestor process.
@@ -3008,8 +3161,10 @@ init_globals(void)
 void
 start_workers(int start_index, int count)
 {
+	const int thread_count = 4;
 	struct worker_proc *c;
 	int pfd[2];
+	int index = 0;
 
 	/* don't do anything if we're not allowed to create new workers */
 	if (!create_workers)
@@ -3030,8 +3185,18 @@ start_workers(int start_index, int count)
 		} else if (c->pid == 0) { /* child */
 			close(pfd[1]);
 			FREE_OBJ(c);
+
+			init_ssl_locks();
+
 			if (CONFIG->CHROOT && CONFIG->CHROOT[0])
 				change_root();
+
+			c->thr_count = thread_count;
+			// :NOTE: First create all listener sockets, before we start up threads
+			for (index = 0; index < thread_count; index++) {
+				prepare_connection_handler_listener_set(&(c->chls[index]));
+			}
+
 			if (CONFIG->UID >= 0 || CONFIG->GID >= 0)
 				drop_privileges();
 			if (geteuid() == 0) {
@@ -3039,8 +3204,18 @@ start_workers(int start_index, int count)
 				    "Refusing to run workers as root.\n");
 				_exit(1);
 			}
-			handle_connections(pfd[0]);
-			exit(0);
+
+			for (index = 0; index < count; index++, start_index++) {
+				if (pthread_create(&(c->chls[index].thr_id),NULL,connection_handler_thread_func, (void*)(&(c->chls[index])) ) != 0) {
+					ERR("{core} ERROR: unable to start thread %d\n", (index+1));
+					_exit(1);
+				}
+
+				handle_connections(pfd[0]);
+
+				deinit_ssl_locks();
+				exit(0);
+			}
 		} else { /* parent. Track new child. */
 			close(pfd[0]);
 			VTAILQ_INSERT_TAIL(&worker_procs, c, list);

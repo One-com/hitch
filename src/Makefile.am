@@ -83,6 +83,7 @@ hitch_LDADD = \
 	$(NSL_LIBS) \
 	$(EV_LIBS) \
 	$(RT_LIBS) \
+	-lpthread \
 	libcfg.a \
 	libforeign.a
 
